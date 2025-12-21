@@ -51,6 +51,7 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
     println!("cargo:rustc-link-lib=cudart");
+    println!("cargo:rustc-link-lib=cuda");  // CUDA Driver API for memory pool management
 
     // On macOS, also check /usr/local/cuda/lib
     #[cfg(target_os = "macos")]

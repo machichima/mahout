@@ -19,6 +19,9 @@ pub mod encodings;
 pub mod pipeline;
 
 #[cfg(target_os = "linux")]
+pub mod buffer_pool;
+
+#[cfg(target_os = "linux")]
 pub(crate) mod cuda_ffi;
 
 pub use memory::GpuStateVector;
@@ -27,3 +30,6 @@ pub use pipeline::run_dual_stream_pipeline;
 
 #[cfg(target_os = "linux")]
 pub use pipeline::PipelineContext;
+
+#[cfg(target_os = "linux")]
+pub use buffer_pool::{BufferPool, PooledBuffer, PoolStats};

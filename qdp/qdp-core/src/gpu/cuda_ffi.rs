@@ -49,4 +49,6 @@ unsafe extern "C" {
         count: usize,
         stream: *mut c_void,
     ) -> i32;
+
+    pub(crate) fn cuMemFree(dptr: *mut c_void) -> i32;
 }
