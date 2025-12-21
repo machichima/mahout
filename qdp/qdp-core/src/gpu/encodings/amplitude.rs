@@ -171,6 +171,7 @@ impl QuantumEncoder for AmplitudeEncoder {
         num_samples: usize,
         sample_size: usize,
         num_qubits: usize,
+        buffer_pool: Option<&std::sync::Mutex<crate::gpu::BufferPool>>,
     ) -> Result<GpuStateVector> {
         crate::profile_scope!("AmplitudeEncoder::encode_batch");
 
@@ -195,8 +196,33 @@ impl QuantumEncoder for AmplitudeEncoder {
         };
 
         // Compute inverse norms on GPU using warp-reduced kernel
-        let inv_norms_gpu = {
+        // Use BufferPool if available, otherwise allocate directly
+        let (inv_norms_ptr, _inv_norms_gpu) = if let Some(pool) = buffer_pool {
             crate::profile_scope!("GPU::BatchNormKernel");
+
+            let buf = pool.lock().unwrap().acquire(num_samples * std::mem::size_of::<f64>())?;
+            let ptr = buf.as_ptr::<f64>();
+
+            let ret = unsafe {
+                launch_l2_norm_batch(
+                    *input_batch_gpu.device_ptr() as *const f64,
+                    num_samples,
+                    sample_size,
+                    ptr,
+                    std::ptr::null_mut(), // default stream
+                )
+            };
+
+            if ret != 0 {
+                return Err(MahoutError::KernelLaunch(
+                    format!("Norm reduction kernel failed: {} ({})", ret, cuda_error_to_string(ret))
+                ));
+            }
+
+            (ptr, Some(buf))
+        } else {
+            crate::profile_scope!("GPU::BatchNormKernel");
+
             let mut buffer = device.alloc_zeros::<f64>(num_samples)
                 .map_err(|e| MahoutError::MemoryAllocation(
                     format!("Failed to allocate norm buffer: {:?}", e)
@@ -218,16 +244,24 @@ impl QuantumEncoder for AmplitudeEncoder {
                 ));
             }
 
-            buffer
+            let ptr = *buffer.device_ptr_mut() as *mut f64;
+            (ptr, None)
         };
 
         // Validate norms on host to catch zero or NaN samples early
         {
             crate::profile_scope!("GPU::NormValidation");
-            let host_inv_norms = device.dtoh_sync_copy(&inv_norms_gpu)
-                .map_err(|e| MahoutError::Cuda(format!("Failed to copy norms to host: {:?}", e)))?;
 
-            if host_inv_norms.iter().any(|v| !v.is_finite() || *v == 0.0) {
+            // Copy from raw pointer - create a temporary vector
+            let mut host_inv_norms = vec![0.0f64; num_samples];
+            unsafe {
+                cudarc::driver::result::memcpy_dtoh_sync(
+                    &mut host_inv_norms,
+                    inv_norms_ptr as u64
+                ).map_err(|e| MahoutError::Cuda(format!("Failed to copy norms to host: {:?}", e)))?;
+            }
+
+            if host_inv_norms.iter().any(|v: &f64| !v.is_finite() || *v == 0.0) {
                 return Err(MahoutError::InvalidInput(
                     "One or more samples have zero or invalid norm".to_string()
                 ));
@@ -244,7 +278,7 @@ impl QuantumEncoder for AmplitudeEncoder {
                 launch_amplitude_encode_batch(
                     *input_batch_gpu.device_ptr() as *const f64,
                     state_ptr as *mut c_void,
-                    *inv_norms_gpu.device_ptr() as *const f64,
+                    inv_norms_ptr,
                     num_samples,
                     sample_size,
                     state_len,

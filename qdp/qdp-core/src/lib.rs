@@ -25,7 +25,7 @@ mod profiling;
 pub use error::{MahoutError, Result};
 pub use gpu::memory::Precision;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 #[cfg(target_os = "linux")]
 use std::ffi::c_void;
 #[cfg(target_os = "linux")]
@@ -33,13 +33,15 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 #[cfg(target_os = "linux")]
 use std::thread;
 
-use cudarc::driver::{CudaDevice, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaDevice, DevicePtr};
 use crate::dlpack::DLManagedTensor;
 use crate::gpu::get_encoder;
 #[cfg(target_os = "linux")]
 use crate::gpu::memory::{PinnedBuffer, GpuStateVector};
 #[cfg(target_os = "linux")]
 use crate::gpu::PipelineContext;
+#[cfg(target_os = "linux")]
+use crate::gpu::BufferPool;
 #[cfg(target_os = "linux")]
 use qdp_kernels::{launch_l2_norm_batch, launch_amplitude_encode_batch};
 
@@ -56,6 +58,8 @@ const STAGE_SIZE_ELEMENTS: usize = STAGE_SIZE_BYTES / std::mem::size_of::<f64>()
 pub struct QdpEngine {
     device: Arc<CudaDevice>,
     precision: Precision,
+    #[cfg(target_os = "linux")]
+    buffer_pool: Mutex<BufferPool>,
 }
 
 impl QdpEngine {
@@ -71,9 +75,15 @@ impl QdpEngine {
     pub fn new_with_precision(device_id: usize, precision: Precision) -> Result<Self> {
         let device = CudaDevice::new(device_id)
             .map_err(|e| MahoutError::Cuda(format!("Failed to initialize CUDA device {}: {:?}", device_id, e)))?;
+
+        #[cfg(target_os = "linux")]
+        let buffer_pool = BufferPool::new(device.clone());
+
         Ok(Self {
-            device,  // CudaDevice::new already returns Arc<CudaDevice> in cudarc 0.11
+            device,
             precision,
+            #[cfg(target_os = "linux")]
+            buffer_pool: Mutex::new(buffer_pool),
         })
     }
 
@@ -114,6 +124,12 @@ impl QdpEngine {
         &self.device
     }
 
+    /// Get buffer pool statistics (Linux only)
+    #[cfg(target_os = "linux")]
+    pub fn buffer_pool_stats(&self) -> crate::gpu::PoolStats {
+        self.buffer_pool.lock().unwrap().stats()
+    }
+
     /// Encode multiple samples in a single fused kernel (most efficient)
     ///
     /// Allocates one large GPU buffer and launches a single batch kernel.
@@ -145,6 +161,8 @@ impl QdpEngine {
             num_samples,
             sample_size,
             num_qubits,
+            #[cfg(target_os = "linux")]
+            Some(&self.buffer_pool),
         )?;
 
         let state_vector = state_vector.to_precision(&self.device, self.precision)?;
@@ -278,8 +296,10 @@ impl QdpEngine {
                                 .add(offset_bytes)
                                 .cast::<std::ffi::c_void>();
 
-                            let mut norm_buffer = self.device.alloc_zeros::<f64>(samples_in_chunk)
-                                .map_err(|e| MahoutError::MemoryAllocation(format!("Failed to allocate norm buffer: {:?}", e)))?;
+                            let norm_buffer = {
+                                let mut pool = self.buffer_pool.lock().unwrap();
+                                pool.acquire(samples_in_chunk * std::mem::size_of::<f64>())?
+                            };
 
                             {
                                 crate::profile_scope!("GPU::NormBatch");
@@ -287,7 +307,7 @@ impl QdpEngine {
                                     dev_ptr as *const f64,
                                     samples_in_chunk,
                                     sample_size,
-                                    *norm_buffer.device_ptr_mut() as *mut f64,
+                                    norm_buffer.as_ptr::<f64>(),
                                     ctx.stream_compute.stream as *mut c_void
                                 );
                                 if ret != 0 {
@@ -300,7 +320,7 @@ impl QdpEngine {
                                 let ret = launch_amplitude_encode_batch(
                                     dev_ptr as *const f64,
                                     state_ptr_offset,
-                                    *norm_buffer.device_ptr() as *const f64,
+                                    norm_buffer.as_ptr::<f64>() as *const f64,
                                     samples_in_chunk,
                                     sample_size,
                                     state_len_per_sample,
@@ -310,6 +330,9 @@ impl QdpEngine {
                                     return Err(MahoutError::KernelLaunch(format!("Encode kernel error: {}", ret)));
                                 }
                             }
+
+                            // Explicitly release norm_buffer back to pool
+                            self.buffer_pool.lock().unwrap().release(norm_buffer);
                         }
 
                         ctx.sync_copy_stream();

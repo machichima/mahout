@@ -139,6 +139,10 @@ impl BufferPool {
 
         block.allocated = false;
         self.stats.current_in_use -= block.size;
+
+        eprintln!("[BufferPool] Released {} bytes ({:.2} MB), in-use: {:.2} MB",
+                  block.size, block.size as f64 / 1e6,
+                  self.stats.current_in_use as f64 / 1e6);
     }
 
     fn find_free_block(&self, size: usize) -> Option<usize> {
@@ -192,8 +196,8 @@ impl BufferPool {
     }
 
     fn allocate_new_block(&mut self, size: usize) -> Result<PooledBuffer> {
-        eprintln!("[BufferPool] Allocating new block from OS: {:.2} MB",
-                  size as f64 / 1e6);
+        eprintln!("[BufferPool] Allocating new block from OS: {} bytes ({:.2} MB)",
+                  size, size as f64 / 1e6);
 
         let buffer = unsafe { self.device.alloc::<u8>(size) }
             .map_err(|e| MahoutError::MemoryAllocation(

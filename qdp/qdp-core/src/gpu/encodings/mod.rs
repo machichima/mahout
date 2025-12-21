@@ -42,6 +42,8 @@ pub trait QuantumEncoder: Send + Sync {
         _num_samples: usize,
         _sample_size: usize,
         _num_qubits: usize,
+        #[cfg(target_os = "linux")]
+        _buffer_pool: Option<&std::sync::Mutex<crate::gpu::BufferPool>>,
     ) -> Result<GpuStateVector> {
         Err(crate::error::MahoutError::NotImplemented(
             format!("Batch encoding not implemented for {}", self.name())
